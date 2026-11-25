@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 
 from mcp.types import Tool
-from ..tools.base import require_target, start_background, stop_background
+from ..tools.base import env_int, require_target, start_background, stop_background
 
 # ---------------------------------------------------------------------------
 # OWASP ZAP integration
@@ -39,7 +39,11 @@ _JAVA_HOMES = [
     "/usr/lib/jvm/java-17-openjdk",
 ]
 
+# ZAP otherwise sizes its heap at a quarter of host RAM. 0 keeps that default.
+HEAP_MB = env_int("KALI_ZAP_HEAP_MB", 1024)
+
 _daemon_proc = None
+_daemon_lock = threading.Lock()
 _daemon_addr = ("", 0)
 _ajax_lock = threading.Lock()
 
@@ -91,6 +95,12 @@ def _version(host: str, port: int) -> str | None:
 
 
 def _ensure_daemon(host: str, port: int, timeout: int = 120) -> str | None:
+    # Concurrent calls must not each start their own JVM.
+    with _daemon_lock:
+        return _start_daemon(host, port, timeout)
+
+
+def _start_daemon(host: str, port: int, timeout: int) -> str | None:
     """Ensure a ZAP daemon is reachable, starting one if necessary.
 
     Returns None on success, or an error string.
@@ -119,6 +129,8 @@ def _ensure_daemon(host: str, port: int, timeout: int = 120) -> str | None:
         "-config", "api.disablekey=true",
         "-config", "start.checkForUpdates=false",
     ]
+    if HEAP_MB:
+        command.append(f"-Xmx{HEAP_MB}m")
     try:
         _daemon_proc = start_background(command, env=env, log_file=log_file)
     except Exception as e:

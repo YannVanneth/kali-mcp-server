@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 from urllib.parse import urlsplit
-from ..tools.base import run_tool, require_target
+from ..tools.base import read_limited, run_tool, require_target
 
 TOOLS = [
     Tool(
@@ -322,7 +322,7 @@ def katana(url: str, depth: int = 3, headless: bool = False, headers: dict | Non
     for key, value in (headers or {}).items():
         command.extend(["-H", f"{key}: {value}"])
     if headless:
-        command.extend(["-headless", "-system-chrome", "-xhr"])
+        command.extend(["-headless", "-system-chrome", "-xhr", "-c", "3"])
         if Path("/usr/bin/chromium").is_file():
             command.extend(["-system-chrome-path", "/usr/bin/chromium"])
         if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -353,7 +353,7 @@ def arjun(url: str, method: str = "GET", headers: dict | None = None, wordlist: 
         if output.startswith("[error]"):
             return output
         if report.is_file():
-            return report.read_text()
+            return read_limited(report)
         if "no parameters" in output.lower():
             return "{}"
         return f"[error] Arjun did not produce a JSON report\n{output}"

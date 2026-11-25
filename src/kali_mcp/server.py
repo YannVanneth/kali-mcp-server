@@ -6,6 +6,7 @@ import hmac
 import os
 import sys
 import tempfile
+import threading
 import urllib.parse
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -21,6 +22,7 @@ from mcp.types import (
 )
 
 from kali_mcp.tools import ALL_TOOLS, TOOL_DISPATCH
+from kali_mcp.tools.base import cancel_event
 
 server = Server("kali-mcp")
 AUTH_TOKEN: str = ""
@@ -83,7 +85,17 @@ async def handle_call_tool(ctx, req: CallToolRequestParams) -> CallToolResult:
 
     args = req.arguments or {}
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, functools.partial(handler, **args))
+    # Cancelling this coroutine cannot stop the worker thread, so signal the
+    # execution gateway to kill the tool when a client cancels or disconnects.
+    cancelled = threading.Event()
+    context = contextvars.copy_context()
+    context.run(cancel_event.set, cancelled)
+    call = functools.partial(handler, **args)
+    try:
+        result = await loop.run_in_executor(None, context.run, call)
+    except asyncio.CancelledError:
+        cancelled.set()
+        raise
     text = str(result)
     return CallToolResult(
         content=[TextContent(type="text", text=_limit_result(text))],

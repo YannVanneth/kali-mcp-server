@@ -6,8 +6,18 @@ services:
     container_name: kali-mcp
     stdin_open: true
     tty: false
+    init: true
+    # Equal memory and swap limits keep scans from pushing the host into swap.
+    mem_limit: ${KALI_MCP_MEMORY:-4g}
+    memswap_limit: ${KALI_MCP_MEMORY:-4g}
+    pids_limit: 2048
     environment:
       - KALI_MCP_AUTH_TOKEN=${KALI_MCP_AUTH_TOKEN:-}
+      - KALI_MCP_MAX_CONCURRENT=${KALI_MCP_MAX_CONCURRENT:-}
+      - KALI_MCP_TOOL_MEMORY_MB=${KALI_MCP_TOOL_MEMORY_MB:-}
+      - KALI_MCP_MAX_OUTPUT_BYTES=${KALI_MCP_MAX_OUTPUT_BYTES:-}
+      - KALI_MCP_MAX_SPOOL_BYTES=${KALI_MCP_MAX_SPOOL_BYTES:-}
+      - KALI_ZAP_HEAP_MB=${KALI_ZAP_HEAP_MB:-}
     cap_add:
       - NET_ADMIN
       - NET_RAW

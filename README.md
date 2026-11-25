@@ -101,7 +101,7 @@ kali-mcp
 The equivalent Docker command is:
 
 ```bash
-docker run --rm -i --platform linux/amd64 \
+docker run --rm -i --init --memory=4g --memory-swap=4g --platform linux/amd64 \
   --cap-add=NET_ADMIN --cap-add=NET_RAW \
   kali-mcp:latest
 ```
@@ -117,7 +117,7 @@ docker compose run --rm kali-mcp
 Run the container on host port **8096**:
 
 ```bash
-docker run --rm --name kali-mcp-http --platform linux/amd64 \
+docker run --rm --init --memory=4g --memory-swap=4g --name kali-mcp-http --platform linux/amd64 \
   -p 8096:8080 \
   --cap-add=NET_ADMIN --cap-add=NET_RAW \
   -e KALI_MCP_AUTH_TOKEN=change-me \
@@ -154,7 +154,9 @@ For clients that accept an `mcpServers` configuration, launch the Docker image o
     "kali": {
       "command": "docker",
       "args": [
-        "run", "--rm", "-i", "--platform", "linux/amd64",
+        "run", "--rm", "-i", "--init",
+        "--memory=4g", "--memory-swap=4g",
+        "--platform", "linux/amd64",
         "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
         "kali-mcp:latest"
       ]
@@ -211,6 +213,20 @@ Missing or incorrect tokens return MCP error code `-32001`. Without a configured
 | `KALI_ZAP_HOST` | `127.0.0.1` | ZAP daemon address |
 | `KALI_ZAP_PORT` | `8090` | ZAP daemon port |
 
+### Resource limits
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `KALI_MCP_MEMORY` | `4g` | Container memory limit (swap included) used by `docker-run.sh` and Compose |
+| `KALI_MCP_MAX_CONCURRENT` | `2` | CLI tools running at once; further calls wait up to 300 seconds |
+| `KALI_MCP_TOOL_MEMORY_MB` | `2048` | Stop a CLI tool when its process tree exceeds this; `0` disables (Linux only) |
+| `KALI_MCP_MAX_OUTPUT_BYTES` | `8388608` | Output loaded into memory per stream; the rest stays in a server-side file. `0` is unlimited |
+| `KALI_MCP_MAX_SPOOL_BYTES` | `268435456` | Stop a tool that prints more than this; `0` is unlimited |
+| `KALI_MCP_SPOOL_DIR` | `/var/tmp` | Disk location for output; avoid RAM-backed tmpfs. The newest 8 truncated outputs are kept |
+| `KALI_ZAP_HEAP_MB` | `1024` | ZAP Java heap; `0` uses ZAP's default of a quarter of host RAM |
+
+Limits are read at startup. Semgrep, Trivy, and headless Katana default to low parallelism; override it through `opts`. When a call times out, is cancelled, or exceeds a limit, its whole process tree is killed and partial output is returned as an error. ZAP is outside the per-tool limits and keeps its heap until `zap_stop`.
+
 ZAP starts automatically when needed and is reused across calls. Use `zap_stop` to shut it down. The Docker image includes ZAP, Java 21, Chromium, and its matching driver.
 
 ## Available tools
@@ -238,7 +254,7 @@ See [TOOLS.md](TOOLS.md) for the complete tool reference.
 Mount your project and pass its container path to tools such as `semgrep`, `gitleaks`, or `trivy`:
 
 ```bash
-docker run --rm -i --platform linux/amd64 \
+docker run --rm -i --init --memory=4g --memory-swap=4g --platform linux/amd64 \
   -v "$PWD/project:/workspace:ro" kali-mcp:latest
 ```
 
@@ -331,6 +347,7 @@ TOOLS.md            # Tool reference
 | HTTP client cannot connect | Check the published port, `-t streamable-http`, and the container's `-H 0.0.0.0` setting |
 | Tool reports an authentication error | Match the client token to the server's configured token |
 | Local tool executable is missing | Install the corresponding utility and make it available on `PATH`, or use Docker |
+| Tool stopped over the memory limit | Narrow the scan, or raise `KALI_MCP_TOOL_MEMORY_MB` and the container limit |
 | Stdio client hangs | Keep Docker stdin open with `-i` and configure the process in an MCP client |
 
 Some tools need network capabilities; the helper grants `NET_ADMIN` and `NET_RAW`. Amass downloads address datasets on first use for actual operations; help and version commands skip those downloads.

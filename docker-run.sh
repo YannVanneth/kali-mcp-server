@@ -26,11 +26,14 @@ ensure_image() {
 run() {
     ensure_image
     echo "[*] Starting $IMAGE (stdio) ..." >&2
-    exec docker run --rm -i --platform linux/amd64 \
+    local memory="${KALI_MCP_MEMORY:-4g}"
+    exec docker run --rm -i --init --platform linux/amd64 \
+        --memory="$memory" --memory-swap="$memory" --pids-limit=2048 \
         --cap-add=NET_ADMIN --cap-add=NET_RAW \
         --mount type=volume,src=kali-mcp-cache,dst=/root/.cache \
         --mount type=volume,src=kali-nuclei-templates,dst=/root/nuclei-templates \
-        -e KALI_MCP_AUTH_TOKEN "$IMAGE"
+        -e KALI_MCP_AUTH_TOKEN -e KALI_MCP_MAX_CONCURRENT -e KALI_MCP_TOOL_MEMORY_MB \
+        -e KALI_MCP_MAX_OUTPUT_BYTES -e KALI_MCP_MAX_SPOOL_BYTES -e KALI_ZAP_HEAP_MB "$IMAGE"
 }
 
 release() {

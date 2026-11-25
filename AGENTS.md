@@ -45,4 +45,5 @@ src/kali_mcp/
 - `zap_*` tools need `zaproxy` + a Java 17/21 LTS JVM (ZAP 2.17 hangs on Java 25); the daemon is auto-started via `start_background()` and driven over its REST API.
 - Streamable-HTTP uses `json_response=True` (`KALI_MCP_JSON_RESPONSE`) so tool results return as `application/json`; SSE frames have a 1 MiB per-event cap in httpx-sse/httpx2 clients that aborts large results with -32000. Optional `KALI_MCP_MAX_RESULT_BYTES` caps a single result (marker + overflow file), 0 = unlimited.
 - Timeout defaults: most tools 120–300s, password cracking 600s, packet capture 60s.
+- `run_tool()`/`run_bash()` bound memory: output spools to disk, concurrency is limited, process trees over `KALI_MCP_TOOL_MEMORY_MB` are killed, and trees are killed on timeout/cancel. Read report files with `read_limited()`, not `read_text()`.
 - `BLOCKED_COMMANDS` set in `base.py` prevents dangerous shell commands from being executed.

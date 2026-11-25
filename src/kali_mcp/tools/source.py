@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 from mcp.types import Tool
-from .base import run_tool
+from .base import read_limited, run_tool
 
 TOOLS = [
     Tool(
@@ -60,6 +60,7 @@ def semgrep(path: str, config: str = "auto", opts: str = "") -> str:
         return "[error] config is required"
     return run_tool([
         "semgrep", "scan", "--config", config, "--json", "--metrics", "off",
+        "--jobs", "2",
         *shlex.split(opts), os.path.abspath(path),
     ], timeout=600)
 
@@ -79,13 +80,13 @@ def gitleaks(path: str, opts: str = "") -> str:
             return output
         if not report.is_file():
             return f"[error] Gitleaks did not produce a JSON report\n{output}"
-        return report.read_text()
+        return read_limited(report)
 
 
 def trivy(path: str, opts: str = "") -> str:
     if not path or not os.path.isdir(path):
         return "[error] path must be an existing directory"
     return run_tool([
-        "trivy", "fs", "--scanners", "vuln", "--format", "json",
+        "trivy", "fs", "--scanners", "vuln", "--format", "json", "--parallel", "2",
         *shlex.split(opts), os.path.abspath(path),
     ], timeout=600)

@@ -1,9 +1,46 @@
-import subprocess
+import codecs
+import contextvars
 import os
 import re
+import selectors
 import shlex
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
 
 DEFAULT_TIMEOUT = 120  # seconds
+
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read an integer setting, falling back to the default when invalid."""
+    try:
+        return max(minimum, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+# Resource limits. 0 disables a limit (except the concurrency limit).
+MAX_CONCURRENT = env_int("KALI_MCP_MAX_CONCURRENT", 2, minimum=1)
+TOOL_MEMORY_MB = env_int("KALI_MCP_TOOL_MEMORY_MB", 2048)
+MAX_OUTPUT_BYTES = env_int("KALI_MCP_MAX_OUTPUT_BYTES", 8 * 1024 * 1024)
+MAX_SPOOL_BYTES = env_int("KALI_MCP_MAX_SPOOL_BYTES", 256 * 1024 * 1024)
+QUEUE_TIMEOUT = 300  # seconds a call may wait for a free slot
+KEPT_OUTPUT_FILES = 8  # newest truncated outputs retained on disk
+_OUTPUT_PREFIX = "kali-mcp-output-"
+# /tmp is frequently a RAM-backed tmpfs, which would defeat spooling to disk.
+SPOOL_DIR = os.environ.get("KALI_MCP_SPOOL_DIR", "") or (
+    "/var/tmp" if os.access("/var/tmp", os.W_OK) else tempfile.gettempdir()
+)
+
+_slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+# Set by the server when the client cancels a call or disconnects.
+cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "kali_mcp_cancel_event", default=None
+)
 BLOCKED_COMMANDS = {
     "rm", "mv", "cp", "dd", "mkfs", "shutdown", "reboot", "poweroff",
     "init", "systemctl", "chown", "chmod", "wget", "curl",
@@ -176,30 +213,242 @@ def _find_blocked(command: str) -> str | None:
     return None
 
 
+def _tool_env() -> dict[str, str]:
+    """Environment nudging language runtimes to stay within the memory limit."""
+    env = os.environ.copy()
+    env.setdefault("MALLOC_ARENA_MAX", "2")
+    if TOOL_MEMORY_MB:
+        soft = TOOL_MEMORY_MB * 3 // 4
+        env.setdefault("GOMEMLIMIT", f"{soft}MiB")
+        env.setdefault("NODE_OPTIONS", f"--max-old-space-size={soft}")
+    return env
+
+
+def _process_tree(root: int) -> set[int]:
+    """Return root, its descendants, and members of its process group."""
+    children: dict[int, list[int]] = {}
+    found = set()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return {root}
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as fh:
+                # The command name may contain spaces, so split after it.
+                fields = fh.read().rpartition(")")[2].split()
+        except OSError:
+            continue
+        pid = int(entry)
+        children.setdefault(int(fields[1]), []).append(pid)
+        if int(fields[2]) == root:
+            found.add(pid)
+    pending = [root, *found]
+    found.add(root)
+    while pending:
+        for pid in children.get(pending.pop(), ()):
+            if pid not in found:
+                found.add(pid)
+                pending.append(pid)
+    return found
+
+
+def _tree_memory_mb(root: int) -> int:
+    """Private and shared-memory use of a process tree, excluding file pages."""
+    total = 0
+    for pid in _process_tree(root):
+        try:
+            with open(f"/proc/{pid}/status") as fh:
+                for line in fh:
+                    if line.startswith(("RssAnon:", "RssShmem:")):
+                        total += int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return total // 1024
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a session leader, its group, and detached descendants."""
+    # A reaped PID may have been reused, so only walk /proc while it is ours.
+    if proc.returncode is None:
+        for pid in _process_tree(proc.pid) - {proc.pid}:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _prefer_for_oom(pid: int) -> None:
+    """Make the kernel OOM killer pick the tool instead of the MCP server."""
+    try:
+        with open(f"/proc/{pid}/oom_score_adj", "w") as fh:
+            fh.write("1000")
+    except OSError:
+        pass
+
+
+def _prune_outputs() -> None:
+    try:
+        files = sorted(Path(SPOOL_DIR).glob(f"{_OUTPUT_PREFIX}*"), key=lambda p: p.stat().st_mtime)
+        for path in files[:-KEPT_OUTPUT_FILES]:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_limited(path: str | Path) -> str:
+    """Read a report file, truncating it to the output limit.
+
+    A truncated report is copied to the spool directory because callers
+    usually delete the original.
+    """
+    with open(path, "rb") as fh:
+        return _bounded_text(fh)
+
+
+def _bounded_text(fh) -> str:
+    """Decode a spooled stream, keeping an overflow copy when it is too large."""
+    size = os.fstat(fh.fileno()).st_size
+    fh.seek(0)
+    data = fh.read(MAX_OUTPUT_BYTES) if MAX_OUTPUT_BYTES else fh.read()
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    text = decoder.decode(data, final=len(data) == size)
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(data) == size:
+        return text
+    location = "<unable to write overflow file>"
+    try:
+        fd, name = tempfile.mkstemp(prefix=_OUTPUT_PREFIX, suffix=".txt", dir=SPOOL_DIR)
+        with os.fdopen(fd, "wb") as out:
+            fh.seek(0)
+            while chunk := fh.read(1 << 20):
+                out.write(chunk)
+        location = name
+        _prune_outputs()
+    except OSError:
+        pass
+    return (f"{text}\n\n…[truncated: {len(data)} of {size} bytes shown; "
+            f"full output written to {location}]")
+
+
+@contextmanager
+def _slot():
+    """Wait for a free execution slot; yields an error string on failure."""
+    event = cancel_event.get()
+    deadline = time.monotonic() + QUEUE_TIMEOUT
+    while not _slots.acquire(timeout=0.25):
+        if event is not None and event.is_set():
+            yield "[error] command cancelled"
+            return
+        if time.monotonic() >= deadline:
+            yield (f"[error] server busy: {MAX_CONCURRENT} tools already running; "
+                   "retry later or raise KALI_MCP_MAX_CONCURRENT")
+            return
+    try:
+        yield None
+    finally:
+        _slots.release()
+
+
+def _supervise(proc: subprocess.Popen, sinks: dict, timeout: int) -> str | None:
+    """Spool output to disk until exit. Returns why the tool was stopped, if it was."""
+    event = cancel_event.get()
+    deadline = time.monotonic() + timeout
+    next_check = 0.0
+    spooled = 0
+    exited_at = None
+    with selectors.DefaultSelector() as selector:
+        for pipe in sinks:
+            selector.register(pipe, selectors.EVENT_READ)
+        while True:
+            now = time.monotonic()
+            if event is not None and event.is_set():
+                return "command cancelled"
+            if now >= deadline:
+                return f"command timed out after {timeout}s"
+            if now >= next_check:
+                next_check = now + 0.5
+                if TOOL_MEMORY_MB and proc.poll() is None:
+                    used = _tree_memory_mb(proc.pid)
+                    if used > TOOL_MEMORY_MB:
+                        return (f"command stopped: used {used} MB, over the {TOOL_MEMORY_MB} MB limit "
+                                "(KALI_MCP_TOOL_MEMORY_MB); reduce its scope or concurrency")
+            if not selector.get_map():
+                try:
+                    proc.wait(timeout=min(0.25, max(0.01, deadline - now)))
+                    return None
+                except subprocess.TimeoutExpired:
+                    continue
+            ready = selector.select(0.1)
+            for key, _ in ready:
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                sinks[key.fileobj].write(chunk)
+                spooled += len(chunk)
+            if MAX_SPOOL_BYTES and spooled > MAX_SPOOL_BYTES:
+                return (f"command stopped: output exceeded {MAX_SPOOL_BYTES} bytes "
+                        "(KALI_MCP_MAX_SPOOL_BYTES); write to a file or narrow the request")
+            # A leftover background child may hold the pipes open forever.
+            if proc.poll() is not None:
+                exited_at = exited_at or now
+                if not ready and now - exited_at > 1:
+                    return None
+
+
+def _execute(command, timeout: int, input_data: str | None = None, **popen_args) -> str:
+    """Run one command with bounded memory, output, concurrency, and lifetime."""
+    with _slot() as busy:
+        if busy:
+            return busy
+        with (tempfile.TemporaryFile(dir=SPOOL_DIR) as out,
+              tempfile.TemporaryFile(dir=SPOOL_DIR) as err):
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                # Never inherit stdin: scanners would consume the MCP stream.
+                stdin=subprocess.PIPE,
+                env=_tool_env(),
+                start_new_session=True,
+                **popen_args,
+            )
+            try:
+                _prefer_for_oom(proc.pid)
+                try:
+                    proc.stdin.write((input_data or "").encode())
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+                stopped = _supervise(proc, {proc.stdout: out, proc.stderr: err}, timeout)
+            finally:
+                _kill_tree(proc)
+                proc.wait()
+                proc.stdout.close()
+                proc.stderr.close()
+            out.flush()
+            err.flush()
+            if stopped or proc.returncode != 0:
+                reason = stopped or f"command exited with code {proc.returncode}"
+                output = "\n".join(filter(None, (_bounded_text(out), _bounded_text(err))))
+                return f"[error] {reason}\n{output}".strip()
+            return _bounded_text(out) or _bounded_text(err)
+
+
 def run_tool(command: list[str], timeout: int = DEFAULT_TIMEOUT, input_data: str = "") -> str:
     executable = os.path.basename(command[0])
     if executable in BLOCKED_COMMANDS:
         return f"[error] command '{executable}' is blocked for safety"
 
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            # Always use a separate pipe and close it after the supplied input.
-            # Inheriting stdin lets scanners consume the MCP protocol stream.
-            input=input_data,
-        )
-        output = result.stdout.strip() or result.stderr.strip()
-        if result.returncode != 0:
-            output = "\n".join(s.strip() for s in (result.stdout, result.stderr) if s.strip())
-            return f"[error] command exited with code {result.returncode}\n{output}".strip()
-        if not output:
-            return "[info] command produced no output"
-        return output
-    except subprocess.TimeoutExpired:
-        return f"[error] command timed out after {timeout}s"
+        return _execute(command, timeout, input_data) or "[info] command produced no output"
     except FileNotFoundError:
         return f"[error] tool '{command[0]}' not found — is it installed?"
     except Exception as e:
@@ -226,23 +475,8 @@ def run_bash(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
         return f"[error] command '{blocked}' is blocked for safety"
 
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            executable="/bin/bash",
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        output = result.stdout.strip() or result.stderr.strip()
-        if result.returncode != 0:
-            output = "\n".join(s.strip() for s in (result.stdout, result.stderr) if s.strip())
-            return f"[error] command exited with code {result.returncode}\n{output}".strip()
-        if not output:
-            return f"[info] command produced no output (exit code {result.returncode})"
-        return output
-    except subprocess.TimeoutExpired:
-        return f"[error] command timed out after {timeout}s"
+        output = _execute(command, timeout, shell=True, executable="/bin/bash")
+        return output or "[info] command produced no output (exit code 0)"
     except Exception as e:
         return f"[error] {e}"
 
@@ -287,6 +521,7 @@ def start_background(
     finally:
         if log_file:
             sink.close()  # child keeps its own duplicate of the fd
+    _prefer_for_oom(proc.pid)
     return proc
 
 
@@ -303,4 +538,6 @@ def stop_background(proc: subprocess.Popen | None, timeout: int = 10) -> bool:
             proc.wait(timeout=timeout)
         except Exception:
             return False
+    finally:
+        _kill_tree(proc)  # browsers and other helpers left in its session
     return True
